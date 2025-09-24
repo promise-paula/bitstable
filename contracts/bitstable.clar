@@ -370,3 +370,152 @@
     (ok true)
   )
 )
+
+;; LIQUIDATION ENGINE
+
+(define-public (set-liquidator
+    (liquidator principal)
+    (authorized bool)
+  )
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    (asserts! (not (is-eq liquidator tx-sender)) ERR-INVALID-AMOUNT) ;; Prevent self-authorization
+    (ok (map-set authorized-liquidators liquidator authorized))
+  )
+)
+
+(define-read-only (calculate-health-factor (vault-id uint))
+  (match (map-get? vaults { vault-id: vault-id })
+    vault (match (get-price "STX")
+      stx-price (match (get-price "xBTC")
+        xbtc-price (let (
+            (collateral-value (+ (* (get stx-collateral vault) stx-price)
+              (* (get xbtc-collateral vault) xbtc-price)
+            ))
+            (debt (get debt vault))
+          )
+          (if (is-eq debt u0)
+            (ok u999999) ;; Infinite health factor if no debt
+            (ok (/ (* collateral-value u100) debt))
+          )
+        )
+        xbtc-err
+        ERR-ORACLE-PRICE-STALE
+      )
+      stx-err
+      ERR-ORACLE-PRICE-STALE
+    )
+    ERR-VAULT-NOT-FOUND
+  )
+)
+
+(define-public (liquidate-vault (vault-id uint))
+  (let (
+      (vault (unwrap! (map-get? vaults { vault-id: vault-id }) ERR-VAULT-NOT-FOUND))
+      (health-factor (unwrap! (calculate-health-factor vault-id) ERR-ORACLE-PRICE-STALE))
+      (debt (get debt vault))
+      (stx-collateral (get stx-collateral vault))
+      (xbtc-collateral (get xbtc-collateral vault))
+      (liquidation-amount (/ (* debt LIQUIDATION-PENALTY) u100))
+    )
+    (asserts! (default-to false (map-get? authorized-liquidators tx-sender))
+      ERR-NOT-AUTHORIZED
+    )
+    (asserts! (get is-active vault) ERR-VAULT-NOT-FOUND)
+    (asserts! (< health-factor LIQUIDATION-RATIO) ERR-LIQUIDATION-NOT-ALLOWED)
+    (asserts! (>= (ft-get-balance usdx tx-sender) debt)
+      ERR-INSUFFICIENT-USDX-BALANCE
+    )
+    ;; Burn liquidator's USDx to cover debt
+    (try! (ft-burn? usdx debt tx-sender))
+    ;; Calculate collateral to liquidator (with penalty)
+    (let (
+        (stx-to-liquidator (/ (* stx-collateral liquidation-amount) debt))
+        (xbtc-to-liquidator (/ (* xbtc-collateral liquidation-amount) debt))
+      )
+      ;; Transfer collateral to liquidator
+      (try! (as-contract (stx-transfer? stx-to-liquidator tx-sender tx-sender)))
+      ;; Mark vault as inactive
+      (map-set vaults { vault-id: vault-id }
+        (merge vault {
+          debt: u0,
+          stx-collateral: (- stx-collateral stx-to-liquidator),
+          xbtc-collateral: (- xbtc-collateral xbtc-to-liquidator),
+          is-active: false,
+          last-update: stacks-block-height,
+        })
+      )
+      ;; Update protocol stats
+      (var-set total-debt (- (var-get total-debt) debt))
+      (var-set total-stx-collateral
+        (- (var-get total-stx-collateral) stx-to-liquidator)
+      )
+      (var-set total-xbtc-collateral
+        (- (var-get total-xbtc-collateral) xbtc-to-liquidator)
+      )
+      (ok true)
+    )
+  )
+)
+
+;; READ-ONLY FUNCTIONS
+
+(define-read-only (get-vault (vault-id uint))
+  (map-get? vaults { vault-id: vault-id })
+)
+
+(define-read-only (get-user-vaults (user principal))
+  (map-get? user-vaults { user: user })
+)
+
+(define-read-only (get-protocol-stats)
+  {
+    total-vaults: (var-get total-vaults),
+    total-debt: (var-get total-debt),
+    total-stx-collateral: (var-get total-stx-collateral),
+    total-xbtc-collateral: (var-get total-xbtc-collateral),
+    total-usdx-supply: (ft-get-supply usdx),
+  }
+)
+
+(define-read-only (is-vault-safe (vault-id uint))
+  (match (calculate-health-factor vault-id)
+    health-factor (ok (>= health-factor LIQUIDATION-RATIO))
+    error (err error)
+  )
+)
+
+;; ADMIN FUNCTIONS
+
+(define-public (emergency-shutdown)
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    ;; Implementation for emergency shutdown
+    (ok true)
+  )
+)
+
+(define-public (update-liquidation-ratio (new-ratio uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    (asserts! (and (>= new-ratio u120) (<= new-ratio u200)) ERR-INVALID-AMOUNT)
+    ;; Note: In production, this would update a data-var
+    (ok true)
+  )
+)
+
+;; INITIALIZATION
+
+;; Initialize oracle operators (contract owner by default)
+(map-set oracle-operators CONTRACT-OWNER true)
+;; Initialize basic price feeds (placeholder prices)
+(map-set price-feeds { asset: "STX" } {
+  price: u1000000,
+  timestamp: stacks-block-height,
+  confidence: u95,
+})
+(map-set price-feeds { asset: "xBTC" } {
+  price: u100000000000,
+  timestamp: stacks-block-height,
+  confidence: u95,
+})
